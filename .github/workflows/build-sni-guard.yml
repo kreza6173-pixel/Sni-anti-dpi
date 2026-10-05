@@ -41,22 +41,30 @@ jobs:
             "context"
             "crypto/tls"
             "encoding/binary"
+            "errors"
             "flag"
             "fmt"
             "io"
             "net"
             "net/http"
             "os"
+            "strconv"
             "strings"
             "sync/atomic"
             "time"
           )
 
+          type upstream struct {
+            url    string
+            ip     string
+            client *http.Client
+          }
+
           var (
-            upstreams []string
+            ups       []*upstream
             cur       int32
             lastLog   int64
-            client    *http.Client
+            socksAddr string
           )
 
           func logf(format string, a ...interface{}) {
@@ -66,6 +74,88 @@ jobs:
             }
             atomic.StoreInt64(&lastLog, now)
             fmt.Fprintf(os.Stderr, format+"\n", a...)
+          }
+
+          // dialTarget connects to target (ip:port), directly or through a SOCKS5 proxy (ByeDPI).
+          func dialTarget(ctx context.Context, target string) (net.Conn, error) {
+            d := &net.Dialer{Timeout: 4 * time.Second}
+            if socksAddr == "" {
+              return d.DialContext(ctx, "tcp", target)
+            }
+            c, err := d.DialContext(ctx, "tcp", socksAddr)
+            if err != nil {
+              return nil, err
+            }
+            fail := func(e error) (net.Conn, error) {
+              c.Close()
+              return nil, e
+            }
+            host, ps, err := net.SplitHostPort(target)
+            if err != nil {
+              return fail(err)
+            }
+            ip4 := net.ParseIP(host).To4()
+            port, perr := strconv.Atoi(ps)
+            if ip4 == nil || perr != nil {
+              return fail(errors.New("socks: need IPv4 target"))
+            }
+            c.SetDeadline(time.Now().Add(9 * time.Second))
+            if _, err := c.Write([]byte{5, 1, 0}); err != nil {
+              return fail(err)
+            }
+            var m [2]byte
+            if _, err := io.ReadFull(c, m[:]); err != nil || m[0] != 5 || m[1] != 0 {
+              return fail(errors.New("socks: handshake failed"))
+            }
+            req := []byte{5, 1, 0, 1, ip4[0], ip4[1], ip4[2], ip4[3], byte(port >> 8), byte(port & 255)}
+            if _, err := c.Write(req); err != nil {
+              return fail(err)
+            }
+            var h [4]byte
+            if _, err := io.ReadFull(c, h[:]); err != nil {
+              return fail(err)
+            }
+            if h[1] != 0 {
+              return fail(fmt.Errorf("socks: connect failed (code %d)", h[1]))
+            }
+            skip := 0
+            switch h[3] {
+            case 1:
+              skip = 6
+            case 4:
+              skip = 18
+            case 3:
+              var l [1]byte
+              if _, err := io.ReadFull(c, l[:]); err != nil {
+                return fail(err)
+              }
+              skip = int(l[0]) + 2
+            }
+            if skip > 0 {
+              if _, err := io.CopyN(io.Discard, c, int64(skip)); err != nil {
+                return fail(err)
+              }
+            }
+            c.SetDeadline(time.Time{})
+            return c, nil
+          }
+
+          func newClient(ip string) *http.Client {
+            tr := &http.Transport{
+              TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+              MaxIdleConnsPerHost: 2,
+              IdleConnTimeout:     60 * time.Second,
+              TLSHandshakeTimeout: 8 * time.Second,
+              ForceAttemptHTTP2:   true,
+              DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+                target := addr
+                if ip != "" {
+                  target = net.JoinHostPort(ip, "443")
+                }
+                return dialTarget(ctx, target)
+              },
+            }
+            return &http.Client{Transport: tr}
           }
 
           func loadUpstreams(path string) {
@@ -78,43 +168,56 @@ jobs:
                 if l == "" || strings.HasPrefix(l, "#") {
                   continue
                 }
-                upstreams = append(upstreams, l)
+                fl := strings.Fields(l)
+                u := &upstream{url: fl[0]}
+                if len(fl) > 1 {
+                  u.ip = fl[1]
+                }
+                u.client = newClient(u.ip)
+                ups = append(ups, u)
               }
             }
-            if len(upstreams) == 0 {
-              upstreams = []string{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query"}
+            if len(ups) == 0 {
+              ups = append(ups, &upstream{url: "https://cloudflare-dns.com/dns-query", ip: "1.1.1.1", client: newClient("1.1.1.1")})
             }
           }
 
+          func resolveOne(u *upstream, q []byte) ([]byte, error) {
+            ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+            defer cancel()
+            req, err := http.NewRequestWithContext(ctx, "POST", u.url, bytes.NewReader(q))
+            if err != nil {
+              return nil, err
+            }
+            req.Header.Set("Content-Type", "application/dns-message")
+            req.Header.Set("Accept", "application/dns-message")
+            resp, err := u.client.Do(req)
+            if err != nil {
+              return nil, err
+            }
+            defer resp.Body.Close()
+            body, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
+            if err != nil {
+              return nil, err
+            }
+            if resp.StatusCode != 200 || len(body) < 12 {
+              return nil, fmt.Errorf("http status %d", resp.StatusCode)
+            }
+            return body, nil
+          }
+
           func resolve(q []byte) ([]byte, error) {
-            n := len(upstreams)
+            n := len(ups)
             start := int(atomic.LoadInt32(&cur))
             var last error
             for i := 0; i < n; i++ {
               idx := (start + i) % n
-              ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-              req, err := http.NewRequestWithContext(ctx, "POST", upstreams[idx], bytes.NewReader(q))
-              if err != nil {
-                cancel()
-                last = err
-                continue
-              }
-              req.Header.Set("Content-Type", "application/dns-message")
-              req.Header.Set("Accept", "application/dns-message")
-              resp, err := client.Do(req)
-              if err != nil {
-                cancel()
-                last = err
-                continue
-              }
-              body, rerr := io.ReadAll(io.LimitReader(resp.Body, 65535))
-              resp.Body.Close()
-              cancel()
-              if rerr == nil && resp.StatusCode == 200 && len(body) >= 12 {
+              r, err := resolveOne(ups[idx], q)
+              if err == nil {
                 atomic.StoreInt32(&cur, int32(idx))
-                return body, nil
+                return r, nil
               }
-              last = fmt.Errorf("bad reply from %s (status %d)", upstreams[idx], resp.StatusCode)
+              last = err
             }
             return nil, last
           }
@@ -199,43 +302,59 @@ jobs:
             }
           }
 
+          // selftest queries every upstream in parallel, prints each result and
+          // remembers the first working one (in list order).
           func selftest() int {
             q := []byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
               3, 'w', 'w', 'w', 7, 'y', 'o', 'u', 't', 'u', 'b', 'e', 3, 'c', 'o', 'm', 0,
               0, 1, 0, 1}
-            r, err := resolve(q)
-            if err != nil {
-              fmt.Fprintln(os.Stderr, "doh test failed:", err)
+            type res struct {
+              i   int
+              err error
+            }
+            ch := make(chan res, len(ups))
+            for i, u := range ups {
+              go func(i int, u *upstream) {
+                r, err := resolveOne(u, q)
+                if err == nil {
+                  if r[3]&0x0f != 0 || binary.BigEndian.Uint16(r[6:8]) == 0 {
+                    err = errors.New("empty answer")
+                  }
+                }
+                ch <- res{i, err}
+              }(i, u)
+            }
+            best := -1
+            for range ups {
+              r := <-ch
+              if r.err == nil {
+                fmt.Fprintf(os.Stderr, "doh ok: %s via %s\n", ups[r.i].url, ups[r.i].ip)
+                if best < 0 || r.i < best {
+                  best = r.i
+                }
+              } else {
+                fmt.Fprintf(os.Stderr, "doh fail: %s via %s: %v\n", ups[r.i].url, ups[r.i].ip, r.err)
+              }
+            }
+            if best < 0 {
               return 1
             }
-            rcode := r[3] & 0x0f
-            an := binary.BigEndian.Uint16(r[6:8])
-            if rcode != 0 || an == 0 {
-              fmt.Fprintf(os.Stderr, "doh test: rcode=%d answers=%d\n", rcode, an)
-              return 1
-            }
-            fmt.Fprintf(os.Stderr, "doh test ok (upstream %s)\n", upstreams[int(atomic.LoadInt32(&cur))])
+            atomic.StoreInt32(&cur, int32(best))
             return 0
           }
 
           func main() {
             listen := flag.String("listen", "127.0.0.1:5353", "listen address")
             conf := flag.String("conf", "doh.conf", "upstream list file")
-            test := flag.Bool("test", false, "test DoH upstreams and exit")
+            socks := flag.String("socks", "", "SOCKS5 proxy (ByeDPI) used for upstream connections")
+            test := flag.Bool("test", false, "test all upstreams and exit")
             flag.Parse()
+            socksAddr = *socks
             loadUpstreams(*conf)
-            tr := &http.Transport{
-              TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-              MaxIdleConnsPerHost: 4,
-              IdleConnTimeout:     60 * time.Second,
-              TLSHandshakeTimeout: 3 * time.Second,
-              ForceAttemptHTTP2:   true,
-              DialContext:         (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
-            }
-            client = &http.Client{Transport: tr}
             if *test {
               os.Exit(selftest())
             }
+            go selftest()
             go serveUDP(*listen)
             serveTCP(*listen)
           }
@@ -252,15 +371,15 @@ jobs:
           cat > module.prop <<'EOF_PROP'
           id=sni-guard
           name=SNI Guard
-          version=1.1
-          versionCode=2
+          version=1.2
+          versionCode=3
           author=local
-          description=Transparent SNI/DPI bypass (ByeDPI) with strategy fallback and DNS-over-HTTPS for DNS poisoning.
+          description=Transparent SNI/DPI bypass (ByeDPI) with strategy fallback and DoH tunnelled through ByeDPI for DNS poisoning.
           EOF_PROP
 
           cat > customize.sh <<'EOF_CUST'
           [ "$ARCH" = "arm64" ] || abort "arm64 only"
-          ui_print "SNI Guard 1.1: installing"
+          ui_print "SNI Guard 1.2: installing"
           set_perm_recursive "$MODPATH" 0 0 0755 0644
           set_perm "$MODPATH/bin/ciadpi" 0 0 0755
           set_perm "$MODPATH/bin/dohfwd" 0 0 0755
@@ -285,13 +404,18 @@ jobs:
           EOF_CONF
 
           cat > doh.conf <<'EOF_DOH'
-          # DNS-over-HTTPS upstreams, tried in order with automatic fallback.
-          # IP-based URLs on purpose: no name lookup needed and no SNI is sent.
-          https://1.1.1.1/dns-query
-          https://8.8.8.8/dns-query
-          https://9.9.9.9/dns-query
-          https://1.0.0.1/dns-query
-          https://8.8.4.4/dns-query
+          # DNS-over-HTTPS upstreams, all tried in parallel at start; the first working one is used.
+          # Format: URL [IP]  - IP is the address to connect to; the URL hostname is sent as SNI
+          # and the connection is carried through ByeDPI so the SNI gets split/disguised.
+          https://cloudflare-dns.com/dns-query 1.1.1.1
+          https://cloudflare-dns.com/dns-query 1.0.0.1
+          https://cloudflare-dns.com/dns-query 104.16.248.249
+          https://cloudflare-dns.com/dns-query 104.16.249.249
+          https://dns.google/dns-query 8.8.8.8
+          https://dns.google/dns-query 8.8.4.4
+          https://dns.quad9.net/dns-query 9.9.9.9
+          https://doh.opendns.com/dns-query 208.67.222.222
+          https://dns.adguard-dns.com/dns-query 94.140.14.14
           EOF_DOH
 
           cat > ctl.sh <<'EOF_CTL'
@@ -300,8 +424,10 @@ jobs:
           BIN="$MODDIR/bin/ciadpi"
           DOH_BIN="$MODDIR/bin/dohfwd"
           PORT=1080
+          SOCKS_PORT=1081
           DOH_PORT=5353
           PIDF="$MODDIR/ciadpi.pid"
+          PIDF2="$MODDIR/ciadpi2.pid"
           DOH_PID="$MODDIR/doh.pid"
           DOH_ON="$MODDIR/doh.on"
           LOG="$MODDIR/log.txt"
@@ -365,22 +491,34 @@ jobs:
 
           build_args() { grep -v '^[[:space:]]*#' "$CONF" | tr '\n' ' '; }
 
+          alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+          socks_start() {
+            alive "$PIDF2" && return 0
+            nohup "$BIN" --ip 127.0.0.1 --port "$SOCKS_PORT" --max-conn 256 $(build_args) >> "$LOG" 2>&1 &
+            echo $! > "$PIDF2"
+            sleep 1
+            alive "$PIDF2"
+          }
+
           doh_start() {
             [ "$USE_DOH" = 1 ] || return 1
             [ -f "$DOH_BIN" ] || return 1
             chmod 755 "$DOH_BIN"
             if [ -f "$DOH_PID" ]; then kill "$(cat "$DOH_PID")" 2>/dev/null; rm -f "$DOH_PID"; fi
-            "$DOH_BIN" -test -conf "$DOH_CONF" >> "$LOG" 2>&1 || return 1
-            nohup "$DOH_BIN" -listen "127.0.0.1:$DOH_PORT" -conf "$DOH_CONF" >> "$LOG" 2>&1 &
+            S=""
+            if socks_start; then S="-socks 127.0.0.1:$SOCKS_PORT"; fi
+            "$DOH_BIN" -test $S -conf "$DOH_CONF" >> "$LOG" 2>&1 || return 1
+            nohup "$DOH_BIN" -listen "127.0.0.1:$DOH_PORT" $S -conf "$DOH_CONF" >> "$LOG" 2>&1 &
             echo $! > "$DOH_PID"
             sleep 1
-            kill -0 "$(cat "$DOH_PID")" 2>/dev/null
+            alive "$DOH_PID"
           }
 
           stop() {
             rules_del
             rm -f "$DOH_ON"
-            for F in "$PIDF" "$DOH_PID"; do
+            for F in "$PIDF" "$PIDF2" "$DOH_PID"; do
               if [ -f "$F" ]; then
                 kill "$(cat "$F")" 2>/dev/null
                 rm -f "$F"
@@ -395,7 +533,7 @@ jobs:
             nohup "$BIN" --transparent --ip 127.0.0.1 --port "$PORT" --max-conn 1024 $(build_args) >> "$LOG" 2>&1 &
             echo $! > "$PIDF"
             sleep 2
-            if kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+            if alive "$PIDF"; then
               DNS=0
               if doh_start; then
                 touch "$DOH_ON"
@@ -421,7 +559,7 @@ jobs:
           }
 
           status() {
-            if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+            if alive "$PIDF"; then
               echo "ciadpi: running (pid $(cat "$PIDF"))"
             else
               echo "ciadpi: stopped"
@@ -489,4 +627,4 @@ jobs:
           zip -r ../sni-guard.zip .
           cd "$GITHUB_WORKSPACE"
           TAG="sni-guard-$(date +%Y%m%d-%H%M%S)"
-          gh release create "$TAG" sni-guard.zip --repo "$GITHUB_REPOSITORY" --title "SNI Guard $TAG" --notes "KernelSU/Magisk module (arm64), v1.1 with DoH. Flash from the manager, then reboot."
+          gh release create "$TAG" sni-guard.zip --repo "$GITHUB_REPOSITORY" --title "SNI Guard $TAG" --notes "KernelSU/Magisk module (arm64), v1.2 with DoH through ByeDPI. Flash from the manager, then reboot."
