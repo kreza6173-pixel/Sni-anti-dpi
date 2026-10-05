@@ -1,0 +1,203 @@
+name: Build SNI Guard module
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      API: "30"
+    steps:
+      - name: Build ciadpi (Android arm64)
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/hufrea/byedpi.git
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cd byedpi
+          make CC="$TC/aarch64-linux-android${API}-clang"
+          "$TC/llvm-strip" ciadpi
+          file ciadpi || true
+          mkdir -p "$GITHUB_WORKSPACE/module/bin"
+          cp ciadpi "$GITHUB_WORKSPACE/module/bin/ciadpi"
+
+      - name: Generate module files
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/module"
+
+          cat > module.prop <<'EOF_PROP'
+          id=sni-guard
+          name=SNI Guard
+          version=1.0
+          versionCode=1
+          author=local
+          description=Transparent SNI/DPI bypass (ByeDPI) with automatic strategy fallback for TCP 80/443.
+          EOF_PROP
+
+          cat > customize.sh <<'EOF_CUST'
+          [ "$ARCH" = "arm64" ] || abort "arm64 only"
+          ui_print "SNI Guard: installing"
+          set_perm_recursive "$MODPATH" 0 0 0755 0644
+          set_perm "$MODPATH/bin/ciadpi" 0 0 0755
+          set_perm "$MODPATH/ctl.sh" 0 0 0755
+          set_perm "$MODPATH/service.sh" 0 0 0755
+          set_perm "$MODPATH/uninstall.sh" 0 0 0755
+          ui_print "Stop ZDT-D before using this module, then reboot."
+          EOF_CUST
+
+          cat > strategy.conf <<'EOF_CONF'
+          # Strategy ladder. Each "--auto=" line starts the NEXT group, which is
+          # used only after the previous group fails (timeout / reset / TLS error).
+          # Lines starting with # are ignored. Edit, then run: sh ctl.sh restart
+          --timeout 3
+          --split 1+s --tlsrec 1+s
+          --auto=torst,ssl_err
+          --disorder 1+s --tlsrec 3+s
+          --auto=torst,ssl_err
+          --fake -1 --ttl 8 --md5sig --split 1+s
+          --auto=torst,ssl_err
+          --disoob 1+s --tlsrec 1+s
+          --auto=torst,ssl_err
+          --split 2 --disorder 3+s --mod-http=h,d --fake -1 --ttl 5
+          EOF_CONF
+
+          cat > ctl.sh <<'EOF_CTL'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          BIN="$MODDIR/bin/ciadpi"
+          PORT=1080
+          PIDF="$MODDIR/ciadpi.pid"
+          LOG="$MODDIR/log.txt"
+          CONF="$MODDIR/strategy.conf"
+          BLOCK_QUIC=1
+          BLOCK_IPV6=1
+
+          log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+          rules_del() {
+            for T in iptables ip6tables; do
+              while $T -w -t nat -D OUTPUT -j SNIG_NAT 2>/dev/null; do :; done
+              $T -w -t nat -F SNIG_NAT 2>/dev/null
+              $T -w -t nat -X SNIG_NAT 2>/dev/null
+              while $T -w -D OUTPUT -j SNIG_FLT 2>/dev/null; do :; done
+              $T -w -F SNIG_FLT 2>/dev/null
+              $T -w -X SNIG_FLT 2>/dev/null
+            done
+          }
+
+          rules_add() {
+            rules_del
+            # IPv4: redirect web traffic of all apps (not root) to ciadpi
+            iptables -w -t nat -N SNIG_NAT || return 1
+            iptables -w -t nat -A SNIG_NAT -m owner --uid-owner 0 -j RETURN
+            for N in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+              iptables -w -t nat -A SNIG_NAT -d $N -j RETURN
+            done
+            iptables -w -t nat -A SNIG_NAT -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "$PORT"
+            iptables -w -t nat -I OUTPUT -j SNIG_NAT
+
+            # IPv4: block QUIC so apps fall back to TCP
+            if [ "$BLOCK_QUIC" = 1 ]; then
+              iptables -w -N SNIG_FLT
+              iptables -w -A SNIG_FLT -m owner --uid-owner 0 -j RETURN
+              iptables -w -A SNIG_FLT -p udp --dport 443 -j REJECT
+              iptables -w -I OUTPUT -j SNIG_FLT
+            fi
+
+            # IPv6: reject web traffic so apps fall back to IPv4
+            if ip6tables -w -N SNIG_FLT 2>/dev/null; then
+              ip6tables -w -A SNIG_FLT -m owner --uid-owner 0 -j RETURN
+              ip6tables -w -A SNIG_FLT -o lo -j RETURN
+              [ "$BLOCK_IPV6" = 1 ] && ip6tables -w -A SNIG_FLT -p tcp -m multiport --dports 80,443 -j REJECT --reject-with tcp-reset
+              [ "$BLOCK_QUIC" = 1 ] && ip6tables -w -A SNIG_FLT -p udp --dport 443 -j REJECT
+              ip6tables -w -I OUTPUT -j SNIG_FLT
+            fi
+            return 0
+          }
+
+          build_args() { grep -v '^[[:space:]]*#' "$CONF" | tr '\n' ' '; }
+
+          stop() {
+            rules_del
+            if [ -f "$PIDF" ]; then
+              kill "$(cat "$PIDF")" 2>/dev/null
+              rm -f "$PIDF"
+            fi
+          }
+
+          start() {
+            stop
+            if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 200000 ]; then : > "$LOG"; fi
+            chmod 755 "$BIN"
+            nohup "$BIN" --transparent --ip 127.0.0.1 --port "$PORT" --max-conn 1024 $(build_args) >> "$LOG" 2>&1 &
+            echo $! > "$PIDF"
+            sleep 2
+            if kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+              if rules_add; then log "started"; else log "iptables rules failed"; fi
+            else
+              log "ciadpi failed to start (check strategy.conf)"
+              rm -f "$PIDF"
+              return 1
+            fi
+          }
+
+          status() {
+            if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+              echo "ciadpi: running (pid $(cat "$PIDF"))"
+            else
+              echo "ciadpi: stopped"
+            fi
+            iptables -w -t nat -S SNIG_NAT 2>/dev/null | head -n 12
+            echo "--- last log lines ---"
+            tail -n 15 "$LOG" 2>/dev/null
+          }
+
+          case "$1" in
+            start) start ;;
+            stop) stop; log "stopped" ;;
+            restart) start ;;
+            status) status ;;
+            *) echo "usage: sh ctl.sh {start|stop|restart|status}" ;;
+          esac
+          EOF_CTL
+
+          cat > service.sh <<'EOF_SVC'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 3; done
+          sleep 15
+          while true; do
+            if [ -f "$MODDIR/disable" ]; then
+              [ -f "$MODDIR/ciadpi.pid" ] && sh "$MODDIR/ctl.sh" stop
+            else
+              P="$(cat "$MODDIR/ciadpi.pid" 2>/dev/null)"
+              if [ -z "$P" ] || ! kill -0 "$P" 2>/dev/null; then
+                sh "$MODDIR/ctl.sh" start
+              fi
+            fi
+            sleep 20
+          done
+          EOF_SVC
+
+          cat > uninstall.sh <<'EOF_UN'
+          #!/system/bin/sh
+          sh "${0%/*}/ctl.sh" stop
+          EOF_UN
+
+          chmod 755 ctl.sh service.sh uninstall.sh bin/ciadpi
+          ls -la . bin
+
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/module"
+          zip -r ../sni-guard.zip .
+          cd "$GITHUB_WORKSPACE"
+          TAG="sni-guard-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" sni-guard.zip --repo "$GITHUB_REPOSITORY" --title "SNI Guard $TAG" --notes "KernelSU/Magisk module (arm64). Flash from the manager, then reboot."
