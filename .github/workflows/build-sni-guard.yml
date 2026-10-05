@@ -20,9 +20,229 @@ jobs:
           cd byedpi
           make CC="$TC/aarch64-linux-android${API}-clang"
           "$TC/llvm-strip" ciadpi
-          file ciadpi || true
           mkdir -p "$GITHUB_WORKSPACE/module/bin"
           cp ciadpi "$GITHUB_WORKSPACE/module/bin/ciadpi"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build DoH forwarder (Go, arm64)
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/dohsrc"
+          cd "$GITHUB_WORKSPACE/dohsrc"
+          cat > main.go <<'EOF_GO'
+          package main
+
+          import (
+            "bufio"
+            "bytes"
+            "context"
+            "crypto/tls"
+            "encoding/binary"
+            "flag"
+            "fmt"
+            "io"
+            "net"
+            "net/http"
+            "os"
+            "strings"
+            "sync/atomic"
+            "time"
+          )
+
+          var (
+            upstreams []string
+            cur       int32
+            lastLog   int64
+            client    *http.Client
+          )
+
+          func logf(format string, a ...interface{}) {
+            now := time.Now().Unix()
+            if now-atomic.LoadInt64(&lastLog) < 30 {
+              return
+            }
+            atomic.StoreInt64(&lastLog, now)
+            fmt.Fprintf(os.Stderr, format+"\n", a...)
+          }
+
+          func loadUpstreams(path string) {
+            f, err := os.Open(path)
+            if err == nil {
+              defer f.Close()
+              sc := bufio.NewScanner(f)
+              for sc.Scan() {
+                l := strings.TrimSpace(sc.Text())
+                if l == "" || strings.HasPrefix(l, "#") {
+                  continue
+                }
+                upstreams = append(upstreams, l)
+              }
+            }
+            if len(upstreams) == 0 {
+              upstreams = []string{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query"}
+            }
+          }
+
+          func resolve(q []byte) ([]byte, error) {
+            n := len(upstreams)
+            start := int(atomic.LoadInt32(&cur))
+            var last error
+            for i := 0; i < n; i++ {
+              idx := (start + i) % n
+              ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+              req, err := http.NewRequestWithContext(ctx, "POST", upstreams[idx], bytes.NewReader(q))
+              if err != nil {
+                cancel()
+                last = err
+                continue
+              }
+              req.Header.Set("Content-Type", "application/dns-message")
+              req.Header.Set("Accept", "application/dns-message")
+              resp, err := client.Do(req)
+              if err != nil {
+                cancel()
+                last = err
+                continue
+              }
+              body, rerr := io.ReadAll(io.LimitReader(resp.Body, 65535))
+              resp.Body.Close()
+              cancel()
+              if rerr == nil && resp.StatusCode == 200 && len(body) >= 12 {
+                atomic.StoreInt32(&cur, int32(idx))
+                return body, nil
+              }
+              last = fmt.Errorf("bad reply from %s (status %d)", upstreams[idx], resp.StatusCode)
+            }
+            return nil, last
+          }
+
+          func servfail(q []byte) []byte {
+            r := make([]byte, 12)
+            if len(q) >= 2 {
+              r[0] = q[0]
+              r[1] = q[1]
+            }
+            r[2] = 0x81
+            r[3] = 0x82
+            return r
+          }
+
+          func answer(q []byte) []byte {
+            if len(q) < 12 {
+              return servfail(q)
+            }
+            r, err := resolve(q)
+            if err != nil {
+              logf("doh: %v", err)
+              return servfail(q)
+            }
+            return r
+          }
+
+          func serveUDP(addr string) {
+            pc, err := net.ListenPacket("udp", addr)
+            if err != nil {
+              fmt.Fprintln(os.Stderr, "udp listen:", err)
+              os.Exit(1)
+            }
+            buf := make([]byte, 4096)
+            for {
+              n, ra, err := pc.ReadFrom(buf)
+              if err != nil {
+                continue
+              }
+              q := append([]byte(nil), buf[:n]...)
+              go func() {
+                pc.WriteTo(answer(q), ra)
+              }()
+            }
+          }
+
+          func handleTCP(c net.Conn) {
+            defer c.Close()
+            for {
+              c.SetReadDeadline(time.Now().Add(10 * time.Second))
+              var lb [2]byte
+              if _, err := io.ReadFull(c, lb[:]); err != nil {
+                return
+              }
+              l := int(binary.BigEndian.Uint16(lb[:]))
+              q := make([]byte, l)
+              if _, err := io.ReadFull(c, q); err != nil {
+                return
+              }
+              r := answer(q)
+              out := make([]byte, 2+len(r))
+              binary.BigEndian.PutUint16(out, uint16(len(r)))
+              copy(out[2:], r)
+              if _, err := c.Write(out); err != nil {
+                return
+              }
+            }
+          }
+
+          func serveTCP(addr string) {
+            l, err := net.Listen("tcp", addr)
+            if err != nil {
+              fmt.Fprintln(os.Stderr, "tcp listen:", err)
+              os.Exit(1)
+            }
+            for {
+              c, err := l.Accept()
+              if err != nil {
+                continue
+              }
+              go handleTCP(c)
+            }
+          }
+
+          func selftest() int {
+            q := []byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+              3, 'w', 'w', 'w', 7, 'y', 'o', 'u', 't', 'u', 'b', 'e', 3, 'c', 'o', 'm', 0,
+              0, 1, 0, 1}
+            r, err := resolve(q)
+            if err != nil {
+              fmt.Fprintln(os.Stderr, "doh test failed:", err)
+              return 1
+            }
+            rcode := r[3] & 0x0f
+            an := binary.BigEndian.Uint16(r[6:8])
+            if rcode != 0 || an == 0 {
+              fmt.Fprintf(os.Stderr, "doh test: rcode=%d answers=%d\n", rcode, an)
+              return 1
+            }
+            fmt.Fprintf(os.Stderr, "doh test ok (upstream %s)\n", upstreams[int(atomic.LoadInt32(&cur))])
+            return 0
+          }
+
+          func main() {
+            listen := flag.String("listen", "127.0.0.1:5353", "listen address")
+            conf := flag.String("conf", "doh.conf", "upstream list file")
+            test := flag.Bool("test", false, "test DoH upstreams and exit")
+            flag.Parse()
+            loadUpstreams(*conf)
+            tr := &http.Transport{
+              TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+              MaxIdleConnsPerHost: 4,
+              IdleConnTimeout:     60 * time.Second,
+              TLSHandshakeTimeout: 3 * time.Second,
+              ForceAttemptHTTP2:   true,
+              DialContext:         (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+            }
+            client = &http.Client{Transport: tr}
+            if *test {
+              os.Exit(selftest())
+            }
+            go serveUDP(*listen)
+            serveTCP(*listen)
+          }
+          EOF_GO
+          go mod init dohfwd
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/module/bin/dohfwd" .
+          ls -la "$GITHUB_WORKSPACE/module/bin"
 
       - name: Generate module files
         run: |
@@ -32,17 +252,18 @@ jobs:
           cat > module.prop <<'EOF_PROP'
           id=sni-guard
           name=SNI Guard
-          version=1.0
-          versionCode=1
+          version=1.1
+          versionCode=2
           author=local
-          description=Transparent SNI/DPI bypass (ByeDPI) with automatic strategy fallback for TCP 80/443.
+          description=Transparent SNI/DPI bypass (ByeDPI) with strategy fallback and DNS-over-HTTPS for DNS poisoning.
           EOF_PROP
 
           cat > customize.sh <<'EOF_CUST'
           [ "$ARCH" = "arm64" ] || abort "arm64 only"
-          ui_print "SNI Guard: installing"
+          ui_print "SNI Guard 1.1: installing"
           set_perm_recursive "$MODPATH" 0 0 0755 0644
           set_perm "$MODPATH/bin/ciadpi" 0 0 0755
+          set_perm "$MODPATH/bin/dohfwd" 0 0 0755
           set_perm "$MODPATH/ctl.sh" 0 0 0755
           set_perm "$MODPATH/service.sh" 0 0 0755
           set_perm "$MODPATH/uninstall.sh" 0 0 0755
@@ -58,23 +279,38 @@ jobs:
           --auto=torst,ssl_err
           --disorder 1+s --tlsrec 3+s
           --auto=torst,ssl_err
-          --fake -1 --ttl 8 --md5sig --split 1+s
-          --auto=torst,ssl_err
           --disoob 1+s --tlsrec 1+s
           --auto=torst,ssl_err
           --split 2 --disorder 3+s --mod-http=h,d --fake -1 --ttl 5
           EOF_CONF
 
+          cat > doh.conf <<'EOF_DOH'
+          # DNS-over-HTTPS upstreams, tried in order with automatic fallback.
+          # IP-based URLs on purpose: no name lookup needed and no SNI is sent.
+          https://1.1.1.1/dns-query
+          https://8.8.8.8/dns-query
+          https://9.9.9.9/dns-query
+          https://1.0.0.1/dns-query
+          https://8.8.4.4/dns-query
+          EOF_DOH
+
           cat > ctl.sh <<'EOF_CTL'
           #!/system/bin/sh
           MODDIR=${0%/*}
           BIN="$MODDIR/bin/ciadpi"
+          DOH_BIN="$MODDIR/bin/dohfwd"
           PORT=1080
+          DOH_PORT=5353
           PIDF="$MODDIR/ciadpi.pid"
+          DOH_PID="$MODDIR/doh.pid"
+          DOH_ON="$MODDIR/doh.on"
           LOG="$MODDIR/log.txt"
           CONF="$MODDIR/strategy.conf"
+          DOH_CONF="$MODDIR/doh.conf"
           BLOCK_QUIC=1
           BLOCK_IPV6=1
+          USE_DOH=1
+          export SSL_CERT_DIR="/apex/com.android.conscrypt/cacerts:/system/etc/security/cacerts"
 
           log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
@@ -90,17 +326,22 @@ jobs:
           }
 
           rules_add() {
+            DNS_ON="$1"
             rules_del
-            # IPv4: redirect web traffic of all apps (not root) to ciadpi
             iptables -w -t nat -N SNIG_NAT || return 1
+            iptables -w -t nat -A SNIG_NAT -d 127.0.0.0/8 -j RETURN
+            # DNS first (before the root exception): send port 53 to the DoH forwarder
+            if [ "$DNS_ON" = 1 ]; then
+              iptables -w -t nat -A SNIG_NAT -p udp --dport 53 -j REDIRECT --to-ports "$DOH_PORT"
+              iptables -w -t nat -A SNIG_NAT -p tcp --dport 53 -j REDIRECT --to-ports "$DOH_PORT"
+            fi
             iptables -w -t nat -A SNIG_NAT -m owner --uid-owner 0 -j RETURN
-            for N in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+            for N in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
               iptables -w -t nat -A SNIG_NAT -d $N -j RETURN
             done
             iptables -w -t nat -A SNIG_NAT -p tcp -m multiport --dports 80,443 -j REDIRECT --to-ports "$PORT"
             iptables -w -t nat -I OUTPUT -j SNIG_NAT
 
-            # IPv4: block QUIC so apps fall back to TCP
             if [ "$BLOCK_QUIC" = 1 ]; then
               iptables -w -N SNIG_FLT
               iptables -w -A SNIG_FLT -m owner --uid-owner 0 -j RETURN
@@ -108,10 +349,13 @@ jobs:
               iptables -w -I OUTPUT -j SNIG_FLT
             fi
 
-            # IPv6: reject web traffic so apps fall back to IPv4
             if ip6tables -w -N SNIG_FLT 2>/dev/null; then
-              ip6tables -w -A SNIG_FLT -m owner --uid-owner 0 -j RETURN
               ip6tables -w -A SNIG_FLT -o lo -j RETURN
+              if [ "$DNS_ON" = 1 ] && [ "$BLOCK_IPV6" = 1 ]; then
+                ip6tables -w -A SNIG_FLT -p udp --dport 53 -j REJECT
+                ip6tables -w -A SNIG_FLT -p tcp --dport 53 -j REJECT --reject-with tcp-reset
+              fi
+              ip6tables -w -A SNIG_FLT -m owner --uid-owner 0 -j RETURN
               [ "$BLOCK_IPV6" = 1 ] && ip6tables -w -A SNIG_FLT -p tcp -m multiport --dports 80,443 -j REJECT --reject-with tcp-reset
               [ "$BLOCK_QUIC" = 1 ] && ip6tables -w -A SNIG_FLT -p udp --dport 443 -j REJECT
               ip6tables -w -I OUTPUT -j SNIG_FLT
@@ -121,12 +365,27 @@ jobs:
 
           build_args() { grep -v '^[[:space:]]*#' "$CONF" | tr '\n' ' '; }
 
+          doh_start() {
+            [ "$USE_DOH" = 1 ] || return 1
+            [ -f "$DOH_BIN" ] || return 1
+            chmod 755 "$DOH_BIN"
+            if [ -f "$DOH_PID" ]; then kill "$(cat "$DOH_PID")" 2>/dev/null; rm -f "$DOH_PID"; fi
+            "$DOH_BIN" -test -conf "$DOH_CONF" >> "$LOG" 2>&1 || return 1
+            nohup "$DOH_BIN" -listen "127.0.0.1:$DOH_PORT" -conf "$DOH_CONF" >> "$LOG" 2>&1 &
+            echo $! > "$DOH_PID"
+            sleep 1
+            kill -0 "$(cat "$DOH_PID")" 2>/dev/null
+          }
+
           stop() {
             rules_del
-            if [ -f "$PIDF" ]; then
-              kill "$(cat "$PIDF")" 2>/dev/null
-              rm -f "$PIDF"
-            fi
+            rm -f "$DOH_ON"
+            for F in "$PIDF" "$DOH_PID"; do
+              if [ -f "$F" ]; then
+                kill "$(cat "$F")" 2>/dev/null
+                rm -f "$F"
+              fi
+            done
           }
 
           start() {
@@ -137,11 +396,27 @@ jobs:
             echo $! > "$PIDF"
             sleep 2
             if kill -0 "$(cat "$PIDF")" 2>/dev/null; then
-              if rules_add; then log "started"; else log "iptables rules failed"; fi
+              DNS=0
+              if doh_start; then
+                touch "$DOH_ON"
+                DNS=1
+              else
+                log "DoH not active (disabled or unreachable): DNS left unchanged"
+              fi
+              if rules_add "$DNS"; then log "started (doh=$DNS)"; else log "iptables rules failed"; fi
             else
               log "ciadpi failed to start (check strategy.conf)"
               rm -f "$PIDF"
               return 1
+            fi
+          }
+
+          dohretry() {
+            [ "$USE_DOH" = 1 ] || return 0
+            [ -f "$DOH_ON" ] && return 0
+            if doh_start; then
+              touch "$DOH_ON"
+              rules_add 1 && log "DoH enabled"
             fi
           }
 
@@ -151,7 +426,8 @@ jobs:
             else
               echo "ciadpi: stopped"
             fi
-            iptables -w -t nat -S SNIG_NAT 2>/dev/null | head -n 12
+            if [ -f "$DOH_ON" ]; then echo "DoH: active"; else echo "DoH: off"; fi
+            iptables -w -t nat -S SNIG_NAT 2>/dev/null | head -n 14
             echo "--- last log lines ---"
             tail -n 15 "$LOG" 2>/dev/null
           }
@@ -160,6 +436,7 @@ jobs:
             start) start ;;
             stop) stop; log "stopped" ;;
             restart) start ;;
+            dohretry) dohretry ;;
             status) status ;;
             *) echo "usage: sh ctl.sh {start|stop|restart|status}" ;;
           esac
@@ -170,6 +447,7 @@ jobs:
           MODDIR=${0%/*}
           while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 3; done
           sleep 15
+          N=0
           while true; do
             if [ -f "$MODDIR/disable" ]; then
               [ -f "$MODDIR/ciadpi.pid" ] && sh "$MODDIR/ctl.sh" stop
@@ -177,6 +455,17 @@ jobs:
               P="$(cat "$MODDIR/ciadpi.pid" 2>/dev/null)"
               if [ -z "$P" ] || ! kill -0 "$P" 2>/dev/null; then
                 sh "$MODDIR/ctl.sh" start
+              elif [ -f "$MODDIR/doh.on" ]; then
+                D="$(cat "$MODDIR/doh.pid" 2>/dev/null)"
+                if [ -z "$D" ] || ! kill -0 "$D" 2>/dev/null; then
+                  sh "$MODDIR/ctl.sh" start
+                fi
+              else
+                N=$((N+1))
+                if [ "$N" -ge 6 ]; then
+                  N=0
+                  sh "$MODDIR/ctl.sh" dohretry
+                fi
               fi
             fi
             sleep 20
@@ -188,7 +477,7 @@ jobs:
           sh "${0%/*}/ctl.sh" stop
           EOF_UN
 
-          chmod 755 ctl.sh service.sh uninstall.sh bin/ciadpi
+          chmod 755 ctl.sh service.sh uninstall.sh bin/ciadpi bin/dohfwd
           ls -la . bin
 
       - name: Package and publish
@@ -200,4 +489,4 @@ jobs:
           zip -r ../sni-guard.zip .
           cd "$GITHUB_WORKSPACE"
           TAG="sni-guard-$(date +%Y%m%d-%H%M%S)"
-          gh release create "$TAG" sni-guard.zip --repo "$GITHUB_REPOSITORY" --title "SNI Guard $TAG" --notes "KernelSU/Magisk module (arm64). Flash from the manager, then reboot."
+          gh release create "$TAG" sni-guard.zip --repo "$GITHUB_REPOSITORY" --title "SNI Guard $TAG" --notes "KernelSU/Magisk module (arm64), v1.1 with DoH. Flash from the manager, then reboot."
